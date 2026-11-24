@@ -10,3 +10,8 @@ CREATE TABLE IF NOT EXISTS raw.api_products (
 
 CREATE INDEX IF NOT EXISTS idx_raw_api_products_batch
     ON raw.api_products (batch_id);
+
+-- Idempotency: the same product cannot be stored twice for one batch,
+-- so re-running a batch (e.g. an Airflow retry) does not create duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_api_products_batch_item
+    ON raw.api_products (source_name, batch_id, (payload->>'id'));
