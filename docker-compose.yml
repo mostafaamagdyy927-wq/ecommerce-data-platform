@@ -15,6 +15,7 @@ services:
       # Schema files run automatically the first time the volume is created.
       - ./sql/01_raw_schema.sql:/docker-entrypoint-initdb.d/01_raw_schema.sql:ro
       - ./sql/02_clean_schema.sql:/docker-entrypoint-initdb.d/02_clean_schema.sql:ro
+      - ./sql/04_raw_olist.sql:/docker-entrypoint-initdb.d/04_raw_olist.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
