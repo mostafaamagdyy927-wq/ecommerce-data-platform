@@ -1,6 +1,10 @@
 """Extract products from a public test API and store them untouched
-in the raw layer (raw.api_products)."""
+in the raw layer (raw.api_products).
 
+Idempotent: the batch id comes from the fetched data, so a run that returns
+the same products reuses the same batch and stores nothing twice."""
+
+import hashlib
 import json
 import logging
 import os
@@ -114,13 +118,19 @@ def fetch_all_products():
     return products
 
 
-def make_batch_id():
-    """Use PIPELINE_BATCH_ID when the orchestrator provides one (e.g. the
-    Airflow run id) so a retried run reuses the same id and stays
-    idempotent; otherwise generate a unique id."""
+def make_batch_id(products=None):
+    """PIPELINE_BATCH_ID (orchestrator) wins; otherwise the id comes from the
+    fetched data, so a run that returns the same products reuses the same batch
+    and stores nothing twice. Without products, fall back to a unique id."""
     provided = os.getenv("PIPELINE_BATCH_ID")
     if provided:
         return provided
+    if products is not None:
+        # Sorted keys and sorted products: the same data always hashes the same,
+        # even if the API returns the pages in a different order.
+        canonical = sorted(products, key=lambda product: str(product.get("id")))
+        payload = json.dumps(canonical, sort_keys=True).encode("utf-8")
+        return "api_" + hashlib.sha256(payload).hexdigest()[:12]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
@@ -160,13 +170,13 @@ def main():
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    batch_id = make_batch_id()
-    log.info("Starting batch %s", batch_id)
-
     products = fetch_all_products()
     log.info("Fetched %s products", len(products))
     if not products:
         raise RuntimeError("API returned no products")
+
+    batch_id = make_batch_id(products)
+    log.info("Starting batch %s", batch_id)
 
     processed = save_raw(products, batch_id)
     log.info("Processed %s rows into raw.api_products", processed)
@@ -174,3 +184,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
