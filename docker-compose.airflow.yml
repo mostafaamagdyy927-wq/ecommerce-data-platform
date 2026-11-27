@@ -1,0 +1,177 @@
+# Airflow 3.4 for the DEPI pipeline (local development).
+#
+# This file only ADDS Airflow. The application database stays in
+# docker-compose.yml (container `ecommerce_postgres`) and is reached over a
+# shared Docker bridge network by its service name, `postgres`, on port 5432 -
+# the published host port (5433) and the 127.0.0.1 binding stay untouched.
+#
+# The shared network is the one the application compose project already
+# created. Start the database first, then Airflow:
+#
+#   docker compose up -d postgres
+#   docker compose -f docker-compose.airflow.yml up -d --build
+#
+# If `docker network ls` shows a different name for that project's network,
+# put it in .env as APP_NETWORK=<name> and run the second command again.
+#
+# Local development only: the secrets below are fixed placeholders.
+---
+x-airflow-common:
+  &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  image: depi-airflow:3.4.0
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    # --- Airflow itself ---
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-depi-local-dev-jwt-secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-depi-local}
+    # Fixed key so encrypted values survive restarts. Local development only.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__FERNET_KEY:-TAuLQsFpVYAKoj3vbuUH9XYlGCvvIURQItukFyZwZpk=}
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/airflow/dags
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # --- the warehouse (read by src/extract/api_client.py and friends) ---
+    # Inside the shared network the application database is `postgres` on its
+    # container port; the values in .env (localhost:5433) are for the host only.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    PYTHONPATH: /opt/airflow/project/src
+    PYTHONUNBUFFERED: "1"
+  volumes:
+    - ./:/opt/airflow/project
+    - airflow-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  # Airflow's own metadata database. It is not the project warehouse.
+  airflow-postgres:
+    image: postgres:16
+    container_name: depi_airflow_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: depi_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "Airflow version:"
+        /entrypoint airflow version
+        echo "Metadata database migrated and admin user ensured."
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+      _AIRFLOW_WWW_USER_FIRSTNAME: Admin
+      _AIRFLOW_WWW_USER_LASTNAME: User
+      _AIRFLOW_WWW_USER_EMAIL: admin@example.com
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: depi_airflow_apiserver
+    command: api-server
+    ports:
+      # Web UI on this machine only, never on the network.
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: depi_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: depi_airflow_dagprocessor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Handy shell inside the Airflow image (profiles: debug, so it never starts by itself):
+  #   docker compose -f docker-compose.airflow.yml run --rm airflow-cli airflow dags list
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+volumes:
+  airflow-db-volume:
+  airflow-logs:
+
+networks:
+  # Every service here joins the network the application compose project already
+  # created, so the pipeline reaches the warehouse as `postgres:5432`.
+  default:
+    name: ${APP_NETWORK:-ecommerce-data-platform_default}
+    external: true

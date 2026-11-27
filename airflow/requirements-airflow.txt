@@ -1,0 +1,6 @@
+# Extra libraries installed inside the Airflow image (see Dockerfile).
+# The project code connects with postgresql+psycopg2, so psycopg2-binary is
+# required even though Airflow itself uses psycopg (v3).
+psycopg2-binary==2.9.13
+requests==2.34.2
+python-dotenv==1.2.4
