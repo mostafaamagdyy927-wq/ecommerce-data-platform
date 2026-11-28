@@ -1,9 +1,14 @@
+"""Load the scraped books JSON into the raw layer (raw.scraped_products).
 
+Idempotent: the batch id comes from the file content, so loading the same
+books_raw.json twice stores the batch once. A new scrape (new file content)
+becomes a new batch.
+"""
+
+import hashlib
 import json
 import logging
 import os
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -75,6 +80,34 @@ def load_books():
     return books
 
 
+def make_batch_id(books):
+    """PIPELINE_BATCH_ID (orchestrator) wins, otherwise a hash of the content.
+
+    Same file -> same batch id, so re-running the loader (or an Airflow retry)
+    never stores the same books twice. Mirrors load.olist_loader.
+    """
+    provided = os.getenv("PIPELINE_BATCH_ID")
+    if provided:
+        return provided
+    canonical = sorted(books, key=lambda book: str(book.get("product_url") or ""))
+    payload = json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return "books_" + hashlib.sha256(payload).hexdigest()[:12]
+
+
+def batch_already_loaded(engine, batch_id):
+    with engine.connect() as connection:
+        count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM raw.scraped_products
+                WHERE source_name = :source_name AND batch_id = :batch_id
+                """
+            ),
+            {"source_name": SOURCE_NAME, "batch_id": batch_id},
+        ).scalar_one()
+    return count > 0
+
+
 def save_raw(books, batch_id):
     insert_sql = text(
         """
@@ -106,15 +139,19 @@ def save_raw(books, batch_id):
 
 def main():
     books = load_books()
-
-    timestamp = datetime.now(timezone.utc).strftime(
-        "%Y%m%dT%H%M%SZ"
-    )
-    batch_id = f"{timestamp}-{uuid.uuid4().hex[:6]}"
+    batch_id = make_batch_id(books)
 
     log.info("Source: %s", SOURCE_NAME)
     log.info("Batch ID: %s", batch_id)
     log.info("Books loaded from JSON: %s", len(books))
+
+    engine = get_engine()
+    try:
+        if batch_already_loaded(engine, batch_id):
+            log.info("Batch %s already in raw.scraped_products, nothing to do", batch_id)
+            return
+    finally:
+        engine.dispose()
 
     saved = save_raw(books, batch_id)
 
@@ -124,3 +161,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
